@@ -1,5 +1,5 @@
 # LipiNet
-A deep learning model for classifying handwritten Devanagari characters and digits using a custom CNN architecture with **residual blocks**, **channel attention**, and **linear capsule routing**.
+A deep learning model for classifying handwritten Devanagari characters and digits using a custom CNN architecture with **scaffold injection**, **residual blocks**, **channel attention**, and **linear capsule routing**.
 
 ---
 
