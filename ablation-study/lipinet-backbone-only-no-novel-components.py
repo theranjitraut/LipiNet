@@ -11,14 +11,13 @@ from tensorflow import keras
 from tensorflow.keras import layers, Model, Input
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping # ReduceLROnPlateau,
 
-# Fix all random seeds so results are reproducible across runs.
+# Reproducibility - Fix all random seeds so results are reproducible across runs.
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# Central dictionary – change values here; nothing else needs editing.
-
+# Configuration - Central dictionary – change values here; nothing else needs editing.
 CFG = {
     "num_classes":      46,      # DHCD: 36 consonants + 10 digits
     "image_size":       32,      # resize every image to 64×64 px
@@ -29,7 +28,7 @@ CFG = {
     "label_smoothing":  0.1,     # prevents over-confident softmax outputs
     "val_split":        0.1,     # fraction of training data held for validation
     # "data_dir":         "./data/DHCD",
-    "data_dir":         "/kaggle/input/datasets/theranjitraut/devanagari/DevanagariHandwrittenCharacterDataset",
+    "data_dir":         "/kaggle/input/datasets/rautranjit/devanagari/DevanagariHandwrittenCharacterDataset",
     "results_dir":      "./results",
 }
 
@@ -39,7 +38,7 @@ IMG         = CFG["image_size"]
 BS          = CFG["batch_size"]
 AUTOTUNE    = tf.data.AUTOTUNE
 
-# Dataset Download & Pipeline
+# Dataset download & pipeline
 # os.makedirs("./data", exist_ok=True)
 # zip_path = "./data/DHCD.zip"
 zip_path = "/kaggle/input/datasets/theranjitraut/devanagari/DevanagariHandwrittenCharacterDataset"
@@ -137,7 +136,8 @@ test_ds_oh = (
 
 print(f"Train: {n_train:,} | Val: {n_val:,} | Test: (batched)")
 
-# Rich terminal output: parameter tables and per-epoch progress bars.
+
+# Display utilities - Rich terminal output: parameter tables and per-epoch progress bars.
 # ANSI colour codes (fall back gracefully on Windows terminals without VT mode)
 _COL = {
     "reset":  "\033[0m",
@@ -283,7 +283,7 @@ def print_comparison_table(results: dict) -> None:
     print(_c(f"╚{'═'*24}╩{'═'*12}╩{'═'*12}╩{'═'*12}╩{'═'*6}╝", "cyan"))
     print(_c(f"\n  ★  Winner: {best_name}  ({results[best_name]['test_acc']:.2f}% test accuracy)\n", "green", "bold"))
 
-#  Shared sub-modules used by our_model-Net.
+# Building blocks - Shared sub-modules used by our_model-Net.
 def gelu(x):
     """gelu activation – smoother than gelu, better gradients in deep nets."""
     return tf.nn.gelu(x)
@@ -309,7 +309,6 @@ def residual_block(x, channels: int):
 def dense_res_block(x, in_channels: int, out_channels: int):
     """
     DenseNet-inspired residual block.
-
     Runs three sequential residual blocks and concatenates their outputs
     (dense connection), then projects back to out_channels via 1×1 conv.
     A strided depthwise conv at the end halves the spatial resolution
@@ -326,18 +325,18 @@ def dense_res_block(x, in_channels: int, out_channels: int):
     else:
         x_in = x
 
-    #  Three chained residual blocks (dense connections) 
+    # Three chained residual blocks (dense connections) 
     r1  = residual_block(x_in, out_channels)
     r2  = residual_block(r1,   out_channels)
     # r3  = residual_block(r2,   out_channels)
     cat = layers.Concatenate()([r1, r2])       #r3 # dense concat
 
-    #  Bottleneck projection back to out_channels 
+    # Bottleneck projection back to out_channels 
     out = layers.Conv2D(out_channels, 1, use_bias=False)(cat)
     out = layers.BatchNormalization()(out)
     out = layers.Activation(gelu)(out)
 
-    #  Spatial downsampling via stride-2 depthwise conv 
+    # Spatial downsampling via stride-2 depthwise conv 
     out = layers.DepthwiseConv2D(3, strides=2, padding="same", use_bias=False)(out)
     out = layers.Conv2D(out_channels, 1, use_bias=False)(out)
     out = layers.BatchNormalization()(out)
@@ -382,7 +381,6 @@ def adaptive_filter_capsule(x, num_classes: int, capsule_dim: int = 16):
     return caps
 
 # Model Definitions
-
 def build_our_model_net(num_classes: int = 46, image_size: int = 32,
     drop_path_rate: float = 0.05,
     dropout_rate: float = 0.3,
@@ -487,15 +485,82 @@ def build_our_model_net(num_classes: int = 46, image_size: int = 32,
     return model
 
 # Registry: model name → builder function (called lazily inside the training loop)
+# MODELS_TF = {
+    # "our_model-Net":    lambda: build_our_model_net(NUM_CLASSES, IMG),
+# }
+#  ABLATION: BACKBONE ONLY (no novel components)
+#
+# Strips out every "novel" contribution of our_model-Net and keeps just the
+# generic feature-extraction backbone + a standard classification head, so
+# its performance can be compared against the full model.
+#
+# Removed vs. our_model-Net:
+#   - Dual-path stem (horizontal "stroke scaffold" conv branch)
+#   - Channel attention (SE) in the stem
+#   - Scaffold residual injection into each encoder stage
+#   - Multi-scale GAP fusion (only the last stage's GAP is used)
+#   - Adaptive Filter Capsule (AFC) head
+#   - Learned gated fusion of AFC + dense logits
+#
+# Kept (this IS the "backbone"):
+#   - Plain 3x3 conv stem
+#   - The same 3-stage dense_res_block encoder (identical channel widths/
+#     depth to our_model-Net, so the comparison isolates the head/attention
+#     contributions rather than confounding with capacity differences)
+#   - GlobalAveragePooling2D -> Dense -> LayerNorm -> activation -> logits
+
+def build_backbone_only_net(
+    num_classes: int = 46,
+    image_size: int = 32,
+    head_units: int = 256,
+) -> Model:
+    """
+    Backbone-only ablation of our_model-Net.
+    Architecture
+    Stem:    single 3×3 conv → BN → gelu   (no scaffold branch, no SE)
+    Encoder: 3 dense_res_block stages, identical to our_model-Net
+             64 → 64 (32×32) → 128 (16×16) → 256 (8×8)
+             (no scaffold residual injection)
+    Head:    GAP(enc3) → Dense(head_units) → LayerNorm → gelu → Dense(logits)
+             (no AFC, no gated fusion, no multi-scale GAP concat)
+    """
+    inp = Input(shape=(image_size, image_size, 1), name="input")
+
+    # Plain stem (no dual path, no stroke scaffold, no channel attention)
+    x = layers.Conv2D(64, 3, padding="same", use_bias=False)(inp)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation(gelu)(x)
+
+    # Backbone encoder — same dense_res_block stages as our_model-Net,
+    # but WITHOUT the scaffold residual injected after each stage.
+    enc1 = dense_res_block(x,    64, 64)
+    enc2 = dense_res_block(enc1, 64, 128)
+    enc3 = dense_res_block(enc2, 128, 256)
+
+    # Standard classification head (no multi-scale fusion, no AFC, no gate)
+    gap = layers.GlobalAveragePooling2D(name="gap")(enc3)
+
+    h = layers.Dense(head_units, use_bias=False, name="head_dense")(gap)
+    h = layers.LayerNormalization(name="head_ln")(h)
+    h = layers.Activation("gelu", name="head_act")(h)
+    outputs = layers.Dense(num_classes, name="logits")(h)
+
+    model = keras.Model(inputs=inp, outputs=outputs, name="Backbone-Only")
+    return model
+
+
+# Register alongside the full model so both get trained/evaluated by the
+# existing training loop (section 8) and appear together in the final
+# comparison table (print_comparison_table).
 MODELS_TF = {
-    "our_model-Net":    lambda: build_our_model_net(NUM_CLASSES, IMG),
+    # "our_model-Net":  lambda: build_our_model_net(NUM_CLASSES, IMG),
+    "Backbone-Only":  lambda: build_backbone_only_net(NUM_CLASSES, IMG),
 }
 
-# LR Scheduler
+# LR Schedule
 class CosineAnnealing(keras.optimizers.schedules.LearningRateSchedule):
     """
     Cosine-annealing schedule without restarts.
-
     LR decays from `base` to a floor of 1e-6 following a half-cosine curve
     over `steps` optimizer steps.
 
@@ -514,10 +579,11 @@ class CosineAnnealing(keras.optimizers.schedules.LearningRateSchedule):
     def get_config(self):
         return {"base": self.base, "steps": int(self.steps)}
 
-# Training & Evaluation Helpers
+#  Training & Evaluation helpers
 def compile_model(model: Model, steps_total: int) -> Model:
     """
     Attach optimiser, loss, and metrics to a model.
+
     Uses AdamW (L2-regularised Adam) with a cosine-annealing LR schedule.
     CategoricalCrossentropy (with from_logits=True) is paired with label
     smoothing to improve calibration and reduce overfitting.
@@ -541,7 +607,6 @@ def compile_model(model: Model, steps_total: int) -> Model:
 def compute_macro_f1(model: Model, dataset) -> float:
     """
     Compute macro-averaged F1 score over all NUM_CLASSES classes.
-
     dataset must yield (images, integer_labels) batches.
     Returns F1 as a percentage (0–100).
     """
@@ -562,7 +627,7 @@ def compute_macro_f1(model: Model, dataset) -> float:
     f1   = 2 * prec * rec / (prec + rec + 1e-8)
     return float(f1.mean() * 100.0)
 
-# Train + Evaluate
+# Train + Evaluate models
 trained_models  = {}
 all_histories   = {}
 steps_per_epoch = sum(1 for _ in train_ds)   # number of batches per epoch
@@ -621,7 +686,7 @@ for name, model_fn in MODELS_TF.items():
     trained_models[name] = model
     all_histories[name]  = history.history
 
-# Final test-set evaluation
+    #  9. FINAL TEST-SET EVALUATION
 results = {}
 
 for name, model in trained_models.items():
@@ -638,11 +703,10 @@ for name, model in trained_models.items():
 # Comparison table
 print_comparison_table(results)
 
-
+# Compute score
 def compute_score(model: Model, dataset) -> float:
     """
     Compute macro-averaged F1 score over all NUM_CLASSES classes.
-
     dataset must yield (images, integer_labels) batches.
     Returns F1 as a percentage (0–100).
     """
@@ -664,6 +728,7 @@ def compute_score(model: Model, dataset) -> float:
     print(f"Precision: {float(prec.mean() * 100.0)}, Recall: {float(rec.mean() * 100.0)}, F1: {float(f1.mean() * 100.0)}")
 compute_score(model, test_ds)
 
+# Confusion matrix
 import numpy as np
 import tensorflow as tf
 
@@ -767,7 +832,7 @@ def compute_confusion_matrix(model: tf.keras.Model, dataset, NUM_CLASSES):
     plt.xlabel('Predicted Label')
     plt.ylabel('True Label')
     plt.tight_layout()
-    # plt.savefig('output/confusion_matrix.png')  # Save to output/ for sharing
+    plt.savefig('output/confusion_matrix.png')
     plt.show()
 
     return conf_matrix
@@ -775,7 +840,7 @@ def compute_confusion_matrix(model: tf.keras.Model, dataset, NUM_CLASSES):
 # Usage (save to output/ directory as required)
 cm = compute_confusion_matrix(model, test_ds, NUM_CLASSES)
 
-# Results
+# Persist results
 results_path = os.path.join(CFG["results_dir"], "tensorflow_results.json")
 with open(results_path, "w") as f:
     json.dump(results, f, indent=2)
